@@ -4,6 +4,7 @@
 #include <winhttp.h>
 #include <bcrypt.h>
 #include <shlobj.h>
+#include <shobjidl.h>
 #include <shellapi.h>
 
 #include <algorithm>
@@ -27,6 +28,7 @@
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
 
 namespace {
 constexpr wchar_t kWindowClass[] = L"LawClientInstallerWindow";
@@ -38,24 +40,30 @@ constexpr UINT WM_APP_STATUS = WM_APP + 1;
 constexpr UINT WM_APP_PROGRESS = WM_APP + 2;
 constexpr UINT WM_APP_DONE = WM_APP + 3;
 constexpr UINT WM_APP_ERROR = WM_APP + 4;
-constexpr int kWindowWidth = 620;
-constexpr int kWindowHeight = 420;
-constexpr int kButtonId = 1001;
+constexpr int kWindowWidth = 560;
+constexpr int kWindowHeight = 380;
 
 HWND g_window = nullptr;
 HFONT g_fontRegular = nullptr;
 HFONT g_fontMedium = nullptr;
 HFONT g_fontBold = nullptr;
 HFONT g_fontTitle = nullptr;
+HFONT g_fontSmall = nullptr;
 HICON g_icon = nullptr;
-std::wstring g_status = L"Ready to install";
-std::wstring g_detail = L"Downloads the latest verified LawClient build.";
+std::wstring g_status = L"Ready";
+std::wstring g_detail;
 std::wstring g_buttonText = L"Install LawClient";
+std::filesystem::path g_installDirectory;
 std::atomic<bool> g_busy{false};
 std::atomic<int> g_progress{0};
 std::atomic<bool> g_finished{false};
-RECT g_buttonRect{92, 314, 528, 360};
-RECT g_closeRect{574, 12, 608, 46};
+bool g_error = false;
+bool g_openAfterInstall = true;
+RECT g_buttonRect{40, 300, 520, 344};
+RECT g_closeRect{510, 12, 544, 46};
+RECT g_changeRect{424, 225, 504, 257};
+RECT g_locationRect{40, 218, 520, 264};
+RECT g_openCheckboxHitRect{40, 214, 250, 248};
 POINT g_dragOrigin{};
 bool g_dragging = false;
 
@@ -445,52 +453,127 @@ bool download_and_verify(const std::wstring& url, const std::string& expectedSha
     return ok;
 }
 
-bool run_silent_installer(const std::filesystem::path& installer, DWORD& exitCode, std::wstring& error) {
-    std::wstring command = L"\"" + installer.wstring() + L"\" /S";
+bool run_silent_installer(const std::filesystem::path& installer,
+                          const std::filesystem::path& installDirectory,
+                          DWORD& exitCode,
+                          std::wstring& error) {
+    if (installDirectory.empty() || !installDirectory.is_absolute()) {
+        error = L"Choose a valid installation folder.";
+        return false;
+    }
+
+    std::wstring target = installDirectory.lexically_normal().wstring();
+    while (target.size() > 3 && (target.back() == L'\\' || target.back() == L'/')) {
+        target.pop_back();
+    }
+
+    // NSIS requires /D= to be the final argument and the path must not be quoted,
+    // even when it contains spaces.
+    std::wstring command = L"\"" + installer.wstring() + L"\" /S /D=" + target;
     std::vector<wchar_t> writable(command.begin(), command.end());
     writable.push_back(L'\0');
+
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION process{};
     if (!CreateProcessW(installer.c_str(), writable.data(), nullptr, nullptr, FALSE,
         CREATE_NO_WINDOW, nullptr, installer.parent_path().c_str(), &startup, &process)) {
-        error = L"Could not start the verified LawClient installer.";
+        error = L"Could not start the LawClient installer.";
         return false;
     }
+
     CloseHandle(process.hThread);
     WaitForSingleObject(process.hProcess, INFINITE);
     if (!GetExitCodeProcess(process.hProcess, &exitCode)) exitCode = 1;
     CloseHandle(process.hProcess);
+
     if (exitCode != 0) {
         std::wstringstream ss;
-        ss << L"LawClient installer exited with code " << exitCode << L".";
+        ss << L"Setup stopped with code " << exitCode << L".";
         error = ss.str();
         return false;
     }
     return true;
 }
 
-std::filesystem::path local_app_data() {
+std::filesystem::path roaming_app_data() {
     PWSTR raw = nullptr;
-    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_DEFAULT, nullptr, &raw)) || !raw) return {};
-    std::filesystem::path result(raw);
-    CoTaskMemFree(raw);
-    return result;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, KF_FLAG_DEFAULT, nullptr, &raw)) && raw) {
+        std::filesystem::path result(raw);
+        CoTaskMemFree(raw);
+        return result;
+    }
+
+    wchar_t fallback[32768]{};
+    DWORD length = GetEnvironmentVariableW(L"APPDATA", fallback, static_cast<DWORD>(std::size(fallback)));
+    if (length > 0 && length < std::size(fallback)) return std::filesystem::path(fallback);
+    return {};
 }
 
-bool launch_installed_lawclient() {
-    auto root = local_app_data();
-    if (root.empty()) return false;
-    const std::array<std::filesystem::path, 4> candidates = {
-        root / L"LawClient" / L"lawclient.exe",
-        root / L"LawClient" / L"LawClient.exe",
-        root / L"Programs" / L"LawClient" / L"lawclient.exe",
-        root / L"Programs" / L"LawClient" / L"LawClient.exe",
+std::filesystem::path default_install_directory() {
+    auto root = roaming_app_data();
+    if (root.empty()) return {};
+    return root / L"LawClient";
+}
+
+bool choose_install_directory(HWND owner) {
+    IFileDialog* dialog = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(&dialog));
+    if (FAILED(hr) || !dialog) return false;
+
+    DWORD options = 0;
+    if (SUCCEEDED(dialog->GetOptions(&options))) {
+        dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+    }
+    dialog->SetTitle(L"Choose LawClient install folder");
+    dialog->SetOkButtonLabel(L"Select Folder");
+
+    std::filesystem::path initial = g_installDirectory;
+    std::error_code existsError;
+    if (initial.empty() || !std::filesystem::exists(initial, existsError) || existsError) initial = initial.parent_path();
+    if (!initial.empty()) {
+        IShellItem* initialItem = nullptr;
+        if (SUCCEEDED(SHCreateItemFromParsingName(initial.c_str(), nullptr, IID_PPV_ARGS(&initialItem))) && initialItem) {
+            dialog->SetFolder(initialItem);
+            initialItem->Release();
+        }
+    }
+
+    bool changed = false;
+    hr = dialog->Show(owner);
+    if (SUCCEEDED(hr)) {
+        IShellItem* result = nullptr;
+        if (SUCCEEDED(dialog->GetResult(&result)) && result) {
+            PWSTR path = nullptr;
+            if (SUCCEEDED(result->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path) {
+                std::filesystem::path selected(path);
+                if (selected.is_absolute()) {
+                    g_installDirectory = selected.lexically_normal();
+                    changed = true;
+                }
+                CoTaskMemFree(path);
+            }
+            result->Release();
+        }
+    }
+
+    dialog->Release();
+    return changed;
+}
+
+bool launch_installed_lawclient(const std::filesystem::path& installDirectory) {
+    if (installDirectory.empty()) return false;
+    const std::array<std::filesystem::path, 2> candidates = {
+        installDirectory / L"lawclient.exe",
+        installDirectory / L"LawClient.exe",
     };
+
     for (const auto& candidate : candidates) {
-        if (!std::filesystem::is_regular_file(candidate)) continue;
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(candidate, ec) || ec) continue;
         auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", candidate.c_str(), nullptr,
-            candidate.parent_path().c_str(), SW_SHOWNORMAL));
+            installDirectory.c_str(), SW_SHOWNORMAL));
         if (result > 32) return true;
     }
     return false;
@@ -505,8 +588,8 @@ std::filesystem::path temporary_installer_path() {
     return std::filesystem::path(temp) / name.str();
 }
 
-void install_worker() {
-    post_status(L"Checking latest build", L"Connecting to LawClient release services...");
+void install_worker(std::filesystem::path installDirectory) {
+    post_status(L"Preparing setup", L"Checking installation files...");
     post_progress(2);
 
     std::string manifest;
@@ -522,14 +605,13 @@ void install_worker() {
     const std::string versionUtf8 = trim_ascii(json_string(manifest, "version"));
     const uint64_t size = json_u64(manifest, "size");
     if (urlUtf8.empty() || !is_sha256(sha) || versionUtf8.empty()) {
-        auto payload = new std::wstring(L"The LawClient installer manifest is invalid or unavailable.");
+        auto payload = new std::wstring(L"Installation files are temporarily unavailable.");
         PostMessageW(g_window, WM_APP_ERROR, 0, reinterpret_cast<LPARAM>(payload));
         return;
     }
 
     const std::wstring installerUrl = utf8_to_wide(urlUtf8);
-    const std::wstring version = utf8_to_wide(versionUtf8);
-    post_status(L"Downloading LawClient", L"Version " + version + L" · verified Windows x64 release");
+    post_status(L"Downloading LawClient", L"Downloading installation files...");
 
     const auto temporary = temporary_installer_path();
     if (temporary.empty()) {
@@ -546,9 +628,9 @@ void install_worker() {
     }
 
     post_progress(88);
-    post_status(L"Installing LawClient", L"Applying the verified release to your Windows account...");
+    post_status(L"Installing LawClient", L"Installing to your selected folder...");
     DWORD exitCode = 0;
-    if (!run_silent_installer(temporary, exitCode, error)) {
+    if (!run_silent_installer(temporary, installDirectory, exitCode, error)) {
         DeleteFileW(temporary.c_str());
         auto payload = new std::wstring(error);
         PostMessageW(g_window, WM_APP_ERROR, 0, reinterpret_cast<LPARAM>(payload));
@@ -557,16 +639,28 @@ void install_worker() {
 
     DeleteFileW(temporary.c_str());
     post_progress(98);
-    post_status(L"Launching LawClient", L"Installation complete. Starting the launcher...");
-    launch_installed_lawclient();
+    post_status(L"Finishing setup", L"Almost done...");
     post_progress(100);
     PostMessageW(g_window, WM_APP_DONE, 0, 0);
 }
 
 void start_install() {
     if (g_busy.exchange(true)) return;
+    if (g_installDirectory.empty() || !g_installDirectory.is_absolute()) {
+        g_busy = false;
+        g_error = true;
+        g_detail = L"Choose a valid installation folder.";
+        g_buttonText = L"Try Again";
+        InvalidateRect(g_window, nullptr, FALSE);
+        return;
+    }
+
     g_finished = false;
-    std::thread(install_worker).detach();
+    g_error = false;
+    g_progress = 0;
+    g_buttonText = L"Installing...";
+    const auto installDirectory = g_installDirectory;
+    std::thread([installDirectory]() { install_worker(installDirectory); }).detach();
 }
 
 void apply_window_effects(HWND hwnd) {
@@ -574,8 +668,18 @@ void apply_window_effects(HWND hwnd) {
     DwmSetWindowAttribute(hwnd, 20, &dark, sizeof(dark));
     const DWORD cornerPreference = 2; // DWMWCP_ROUND
     DwmSetWindowAttribute(hwnd, 33, &cornerPreference, sizeof(cornerPreference));
-    HRGN region = CreateRoundRectRgn(0, 0, kWindowWidth + 1, kWindowHeight + 1, 28, 28);
+    HRGN region = CreateRoundRectRgn(0, 0, kWindowWidth + 1, kWindowHeight + 1, 24, 24);
     if (region) SetWindowRgn(hwnd, region, TRUE);
+}
+
+void draw_checkmark(HDC dc, const RECT& box) {
+    HPEN pen = CreatePen(PS_SOLID, 2, rgb(0xFFFFFF));
+    auto oldPen = SelectObject(dc, pen);
+    MoveToEx(dc, box.left + 4, box.top + 9, nullptr);
+    LineTo(dc, box.left + 8, box.top + 13);
+    LineTo(dc, box.left + 15, box.top + 5);
+    SelectObject(dc, oldPen);
+    DeleteObject(pen);
 }
 
 void paint(HWND hwnd) {
@@ -584,40 +688,70 @@ void paint(HWND hwnd) {
     RECT client{};
     GetClientRect(hwnd, &client);
 
-    HBRUSH background = CreateSolidBrush(rgb(0x0B0D10));
+    HBRUSH background = CreateSolidBrush(rgb(0x0A0C0F));
     FillRect(dc, &client, background);
     DeleteObject(background);
 
-    RECT shell{20, 20, client.right - 20, client.bottom - 20};
-    fill_round_rect(dc, shell, 26, rgb(0x101319));
+    RECT shell{16, 16, client.right - 16, client.bottom - 16};
+    fill_round_rect(dc, shell, 22, rgb(0x101319));
 
-    RECT topLine{21, 20, client.right - 21, 22};
+    RECT topLine{17, 16, client.right - 17, 18};
     HBRUSH accent = CreateSolidBrush(rgb(0x2E7CF6));
     FillRect(dc, &topLine, accent);
     DeleteObject(accent);
 
-    if (g_icon) DrawIconEx(dc, 50, 48, g_icon, 38, 38, 0, nullptr, DI_NORMAL);
-    RECT brand{101, 44, 360, 77};
+    if (g_icon) DrawIconEx(dc, 40, 38, g_icon, 34, 34, 0, nullptr, DI_NORMAL);
+    RECT brand{86, 34, 330, 61};
     draw_text(dc, L"LAWCLIENT", brand, g_fontBold, rgb(0xF4F7FB), DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    RECT brandSub{101, 70, 400, 96};
-    draw_text(dc, L"WINDOWS INSTALLER", brandSub, g_fontMedium, rgb(0x6F7783), DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    RECT brandSub{86, 57, 340, 82};
+    draw_text(dc, L"WINDOWS INSTALLER", brandSub, g_fontSmall, rgb(0x77808C), DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     RECT closeGlyph = g_closeRect;
-    draw_text(dc, L"×", closeGlyph, g_fontTitle, rgb(0x7A828D), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    draw_text(dc, L"x", closeGlyph, g_fontMedium, rgb(0x7A828D), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-    RECT heading{50, 122, client.right - 50, 164};
-    draw_text(dc, g_finished ? L"LawClient is ready" : (g_busy ? L"Setting up LawClient" : L"Install LawClient"),
-        heading, g_fontTitle, rgb(0xF7F9FC), DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    RECT subheading{50, 162, client.right - 50, 194};
-    draw_text(dc, g_busy ? g_status : L"Fast. Clean. Ready to launch.", subheading, g_fontMedium,
-        g_busy ? rgb(0xD4D9E0) : rgb(0x929AA6), DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    std::wstring heading = L"Install LawClient";
+    std::wstring subheading = L"Fast. Clean. Ready to launch.";
+    COLORREF subColor = rgb(0x929AA6);
 
-    RECT detail{50, 195, client.right - 50, 229};
-    draw_text(dc, g_busy ? g_detail : L"Latest verified build · automatic updates stay enabled",
-        detail, g_fontRegular, rgb(0x68717D), DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    if (g_busy) {
+        heading = L"Setting up LawClient";
+        subheading = g_status;
+        subColor = rgb(0xD4D9E0);
+    } else if (g_finished) {
+        heading = L"LawClient is ready";
+        subheading = L"Installation completed successfully.";
+        subColor = rgb(0xAAB2BD);
+    } else if (g_error) {
+        heading = L"Setup could not finish";
+        subheading = g_detail.empty() ? L"Please try again." : g_detail;
+        subColor = rgb(0xAAB2BD);
+    }
 
-    if (g_busy || g_finished) {
-        RECT track{50, 248, client.right - 50, 258};
+    RECT headingRect{40, 104, client.right - 40, 143};
+    draw_text(dc, heading, headingRect, g_fontTitle, rgb(0xF7F9FC), DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    RECT subheadingRect{40, 145, client.right - 40, 178};
+    draw_text(dc, subheading, subheadingRect, g_fontMedium, subColor,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    if (!g_busy && !g_finished) {
+        RECT label{40, 190, 220, 216};
+        draw_text(dc, L"Install location", label, g_fontSmall, rgb(0x6F7884), DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+        fill_round_rect(dc, g_locationRect, 12, rgb(0x171B22));
+        RECT pathRect{54, 221, 414, 261};
+        draw_text(dc, g_installDirectory.wstring(), pathRect, g_fontRegular, rgb(0xAAB2BD),
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_PATH_ELLIPSIS);
+        fill_round_rect(dc, g_changeRect, 10, rgb(0x202631));
+        RECT changeText = g_changeRect;
+        draw_text(dc, L"Change", changeText, g_fontSmall, rgb(0xD7DCE3), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    if (g_busy) {
+        RECT detailRect{40, 186, client.right - 40, 214};
+        draw_text(dc, g_detail, detailRect, g_fontRegular, rgb(0x6F7884),
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+        RECT track{40, 230, client.right - 40, 240};
         fill_round_rect(dc, track, 10, rgb(0x202631));
         int width = track.right - track.left;
         int progress = std::clamp(g_progress.load(), 0, 100);
@@ -626,18 +760,30 @@ void paint(HWND hwnd) {
             bar.right = bar.left + std::max(10, (width * progress) / 100);
             fill_round_rect(dc, bar, 10, rgb(0x2E7CF6));
         }
-        RECT percent{client.right - 110, 266, client.right - 50, 290};
-        draw_text(dc, std::to_wstring(progress) + L"%", percent, g_fontMedium, rgb(0x7F8A98), DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        RECT percent{client.right - 95, 247, client.right - 40, 273};
+        draw_text(dc, std::to_wstring(progress) + L"%", percent, g_fontSmall,
+            rgb(0x7F8A98), DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     }
 
-    COLORREF buttonColor = g_finished ? rgb(0x1B2028) : (g_busy ? rgb(0x171B22) : rgb(0x2E7CF6));
-    fill_round_rect(dc, g_buttonRect, 18, buttonColor);
-    RECT buttonText = g_buttonRect;
-    draw_text(dc, g_buttonText, buttonText, g_fontBold,
-        (g_busy && !g_finished) ? rgb(0x646D79) : rgb(0xFFFFFF), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    if (g_finished) {
+        RECT box{40, 218, 58, 236};
+        fill_round_rect(dc, box, 5, g_openAfterInstall ? rgb(0x2E7CF6) : rgb(0x202631));
+        if (g_openAfterInstall) draw_checkmark(dc, box);
+        RECT openLabel{68, 211, 260, 244};
+        draw_text(dc, L"Open LawClient", openLabel, g_fontRegular, rgb(0xCDD3DB),
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    }
 
-    RECT footer{50, 372, client.right - 50, 395};
-    draw_text(dc, L"lawclient.online  ·  Windows x64", footer, g_fontRegular, rgb(0x535B65), DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    COLORREF buttonColor = rgb(0x2E7CF6);
+    COLORREF buttonTextColor = rgb(0xFFFFFF);
+    if (g_busy) {
+        buttonColor = rgb(0x181D25);
+        buttonTextColor = rgb(0x67717E);
+    }
+    fill_round_rect(dc, g_buttonRect, 16, buttonColor);
+    RECT buttonText = g_buttonRect;
+    draw_text(dc, g_buttonText, buttonText, g_fontBold, buttonTextColor,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
     EndPaint(hwnd, &ps);
 }
@@ -647,28 +793,47 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         case WM_CREATE:
             apply_window_effects(hwnd);
             return 0;
+
         case WM_LBUTTONDOWN: {
             POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             if (PtInRect(&g_closeRect, point)) {
-                if (!g_busy || g_finished) DestroyWindow(hwnd);
+                if (!g_busy) DestroyWindow(hwnd);
                 return 0;
             }
+
+            if (!g_busy && !g_finished && PtInRect(&g_changeRect, point)) {
+                if (choose_install_directory(hwnd)) {
+                    g_error = false;
+                    g_buttonText = L"Install LawClient";
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                return 0;
+            }
+
+            if (g_finished && PtInRect(&g_openCheckboxHitRect, point)) {
+                g_openAfterInstall = !g_openAfterInstall;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+
             if (PtInRect(&g_buttonRect, point)) {
                 if (g_finished) {
-                    launch_installed_lawclient();
+                    if (g_openAfterInstall) launch_installed_lawclient(g_installDirectory);
                     DestroyWindow(hwnd);
                 } else if (!g_busy) {
                     start_install();
                 }
                 return 0;
             }
-            if (point.y < 110) {
+
+            if (point.y < 94) {
                 g_dragging = true;
                 g_dragOrigin = point;
                 SetCapture(hwnd);
             }
             return 0;
         }
+
         case WM_MOUSEMOVE:
             if (g_dragging && (wParam & MK_LBUTTON)) {
                 POINT cursor{};
@@ -679,12 +844,14 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
                     0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
             }
             return 0;
+
         case WM_LBUTTONUP:
             if (g_dragging) {
                 g_dragging = false;
                 ReleaseCapture();
             }
             return 0;
+
         case WM_APP_STATUS: {
             auto payload = reinterpret_cast<std::pair<std::wstring, std::wstring>*>(lParam);
             if (payload) {
@@ -695,22 +862,27 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
+
         case WM_APP_PROGRESS:
             g_progress = static_cast<int>(wParam);
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
+
         case WM_APP_DONE:
             g_finished = true;
             g_busy = false;
+            g_error = false;
             g_status = L"Installed successfully";
-            g_detail = L"LawClient is installed and ready to use.";
-            g_buttonText = L"Open LawClient";
+            g_detail.clear();
+            g_buttonText = L"Done";
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
+
         case WM_APP_ERROR: {
             auto payload = reinterpret_cast<std::wstring*>(lParam);
             g_busy = false;
             g_finished = false;
+            g_error = true;
             g_progress = 0;
             g_status = L"Installation failed";
             g_detail = payload ? *payload : L"An unexpected error occurred.";
@@ -720,13 +892,14 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             MessageBeep(MB_ICONERROR);
             return 0;
         }
+
         case WM_ERASEBKGND:
             return 1;
         case WM_PAINT:
             paint(hwnd);
             return 0;
         case WM_CLOSE:
-            if (!g_busy || g_finished) DestroyWindow(hwnd);
+            if (!g_busy) DestroyWindow(hwnd);
             return 0;
         case WM_DESTROY:
             PostQuitMessage(0);
@@ -748,10 +921,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
     g_fontRegular = make_font(14, FW_NORMAL);
+    g_fontSmall = make_font(13, FW_MEDIUM);
     g_fontMedium = make_font(15, FW_SEMIBOLD);
-    g_fontBold = make_font(16, FW_BOLD);
-    g_fontTitle = make_font(28, FW_SEMIBOLD);
+    g_fontBold = make_font(15, FW_BOLD);
+    g_fontTitle = make_font(25, FW_SEMIBOLD);
     g_icon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_APP_ICON));
+    g_installDirectory = default_install_directory();
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -784,6 +959,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
 
     if (g_fontRegular) DeleteObject(g_fontRegular);
+    if (g_fontSmall) DeleteObject(g_fontSmall);
     if (g_fontMedium) DeleteObject(g_fontMedium);
     if (g_fontBold) DeleteObject(g_fontBold);
     if (g_fontTitle) DeleteObject(g_fontTitle);
