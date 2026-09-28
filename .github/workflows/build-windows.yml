@@ -2,8 +2,10 @@ name: Build LawClient Installer
 
 on:
   workflow_dispatch:
+
   push:
-    branches: ["main"]
+    branches:
+      - main
     paths:
       - "src/**"
       - "assets/**"
@@ -19,27 +21,92 @@ concurrency:
 
 jobs:
   windows-x64:
-    runs-on: windows-latest
+    name: Build Windows x64
+    runs-on: windows-2022
     timeout-minutes: 15
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v4
 
-      - name: Configure x64 Release
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
-
-      - name: Build tiny native installer
-        run: cmake --build build --config Release --target LawClientInstaller
-
-      - name: Show executable size
+      - name: Show build environment
         shell: pwsh
         run: |
-          $exe = Get-Item "build/Release/LawClientInstaller.exe"
-          Write-Host ("LawClientInstaller.exe = {0:N2} MiB" -f ($exe.Length / 1MB))
+          Write-Host "Windows:"
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsBuildNumber
 
-      - name: Upload EXE
+          Write-Host ""
+          Write-Host "CMake:"
+          cmake --version
+
+          Write-Host ""
+          Write-Host "Visual Studio installations:"
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+            -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+
+      - name: Configure x64 Release
+        shell: pwsh
+        run: |
+          cmake `
+            -S . `
+            -B build `
+            -G "Visual Studio 17 2022" `
+            -A x64
+
+      - name: Build LawClient Installer
+        shell: pwsh
+        run: |
+          cmake `
+            --build build `
+            --config Release `
+            --target LawClientInstaller `
+            --parallel
+
+      - name: Verify executable
+        shell: pwsh
+        run: |
+          $exePath = "build/Release/LawClientInstaller.exe"
+
+          if (-not (Test-Path $exePath)) {
+            Write-Error "LawClientInstaller.exe was not generated."
+            exit 1
+          }
+
+          $exe = Get-Item $exePath
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host " LawClient Installer Build Complete"
+          Write-Host "=========================================="
+          Write-Host ("Path : {0}" -f $exe.FullName)
+          Write-Host ("Size : {0:N2} MiB" -f ($exe.Length / 1MB))
+          Write-Host ("Bytes: {0}" -f $exe.Length)
+          Write-Host "=========================================="
+          Write-Host ""
+
+      - name: Generate SHA-256
+        shell: pwsh
+        run: |
+          $exePath = "build/Release/LawClientInstaller.exe"
+          $hash = (Get-FileHash $exePath -Algorithm SHA256).Hash.ToLower()
+
+          $hash | Out-File `
+            -FilePath "build/Release/LawClientInstaller.exe.sha256" `
+            -Encoding ascii `
+            -NoNewline
+
+          Write-Host "SHA-256:"
+          Write-Host $hash
+
+      - name: Upload LawClient Installer
         uses: actions/upload-artifact@v4
         with:
           name: LawClient-Installer-Windows-x64
           if-no-files-found: error
           compression-level: 0
-          path: build/Release/LawClientInstaller.exe
+          retention-days: 30
+          path: |
+            build/Release/LawClientInstaller.exe
+            build/Release/LawClientInstaller.exe.sha256
