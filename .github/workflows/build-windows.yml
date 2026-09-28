@@ -1,0 +1,45 @@
+name: Build LawClient Installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths:
+      - "src/**"
+      - "assets/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/build-windows.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lawclient-installer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure x64 Release
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build tiny native installer
+        run: cmake --build build --config Release --target LawClientInstaller
+
+      - name: Show executable size
+        shell: pwsh
+        run: |
+          $exe = Get-Item "build/Release/LawClientInstaller.exe"
+          Write-Host ("LawClientInstaller.exe = {0:N2} MiB" -f ($exe.Length / 1MB))
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: LawClient-Installer-Windows-x64
+          if-no-files-found: error
+          compression-level: 0
+          path: build/Release/LawClientInstaller.exe
