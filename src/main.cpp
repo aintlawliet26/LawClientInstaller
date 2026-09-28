@@ -688,14 +688,13 @@ void paint(HWND hwnd) {
     RECT client{};
     GetClientRect(hwnd, &client);
 
-    HBRUSH background = CreateSolidBrush(rgb(0x0A0C0F));
+    // One edge-to-edge installer surface. The window region itself provides
+    // the rounded outer shape, so there is no second inset card/frame.
+    HBRUSH background = CreateSolidBrush(rgb(0x101319));
     FillRect(dc, &client, background);
     DeleteObject(background);
 
-    RECT shell{16, 16, client.right - 16, client.bottom - 16};
-    fill_round_rect(dc, shell, 22, rgb(0x101319));
-
-    RECT topLine{17, 16, client.right - 17, 18};
+    RECT topLine{0, 0, client.right, 2};
     HBRUSH accent = CreateSolidBrush(rgb(0x2E7CF6));
     FillRect(dc, &topLine, accent);
     DeleteObject(accent);
