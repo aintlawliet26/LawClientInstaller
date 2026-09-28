@@ -50,6 +50,8 @@ HFONT g_fontBold = nullptr;
 HFONT g_fontTitle = nullptr;
 HFONT g_fontSmall = nullptr;
 HICON g_icon = nullptr;
+HCURSOR g_cursorArrow = nullptr;
+HCURSOR g_cursorHand = nullptr;
 std::wstring g_status = L"Ready";
 std::wstring g_detail;
 std::wstring g_buttonText = L"Install LawClient";
@@ -66,6 +68,14 @@ RECT g_locationRect{40, 218, 520, 264};
 RECT g_openCheckboxHitRect{40, 214, 250, 248};
 POINT g_dragOrigin{};
 bool g_dragging = false;
+
+bool is_clickable_point(const POINT& point) {
+    if (!g_busy && PtInRect(&g_closeRect, point)) return true;
+    if (!g_busy && !g_finished && PtInRect(&g_changeRect, point)) return true;
+    if (g_finished && PtInRect(&g_openCheckboxHitRect, point)) return true;
+    if (!g_busy && PtInRect(&g_buttonRect, point)) return true;
+    return false;
+}
 
 COLORREF rgb(unsigned hex) {
     return RGB((hex >> 16) & 0xff, (hex >> 8) & 0xff, hex & 0xff);
@@ -833,6 +843,16 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             return 0;
         }
 
+        case WM_SETCURSOR:
+            if (LOWORD(lParam) == HTCLIENT) {
+                POINT cursor{};
+                GetCursorPos(&cursor);
+                ScreenToClient(hwnd, &cursor);
+                SetCursor(is_clickable_point(cursor) ? g_cursorHand : g_cursorArrow);
+                return TRUE;
+            }
+            break;
+
         case WM_MOUSEMOVE:
             if (g_dragging && (wParam & MK_LBUTTON)) {
                 POINT cursor{};
@@ -925,6 +945,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     g_fontBold = make_font(15, FW_BOLD);
     g_fontTitle = make_font(25, FW_SEMIBOLD);
     g_icon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_APP_ICON));
+    g_cursorArrow = LoadCursorW(nullptr, IDC_ARROW);
+    g_cursorHand = LoadCursorW(nullptr, IDC_HAND);
     g_installDirectory = default_install_directory();
 
     WNDCLASSEXW wc{};
@@ -933,7 +955,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     wc.hInstance = instance;
     wc.hIcon = g_icon;
     wc.hIconSm = g_icon;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hCursor = g_cursorArrow;
     wc.hbrBackground = nullptr;
     wc.lpszClassName = kWindowClass;
     if (!RegisterClassExW(&wc)) return 1;
