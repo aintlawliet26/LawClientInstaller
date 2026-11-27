@@ -923,9 +923,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         case WM_DESTROY:
             PostQuitMessage(0);
             return 0;
-        default:
-            return DefWindowProcW(hwnd, message, wParam, lParam);
     }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
 HFONT make_font(int px, int weight) {

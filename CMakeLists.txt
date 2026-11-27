@@ -22,6 +22,7 @@ target_link_libraries(LawClientInstaller PRIVATE
 )
 
 if(MSVC)
+  set_property(TARGET LawClientInstaller PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
   target_compile_options(LawClientInstaller PRIVATE /O1 /GL /Gy /Gw /permissive- /EHsc /W4)
   target_link_options(LawClientInstaller PRIVATE /LTCG /OPT:REF /OPT:ICF /INCREMENTAL:NO)
 endif()
